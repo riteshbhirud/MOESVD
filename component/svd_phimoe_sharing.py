@@ -1,0 +1,307 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import Optional, Tuple
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
+from .phimoe.configuration_phimoe import PhiMoEConfig
+class SVD_PhiMoEAttention(nn.Module):
+    def __init__(self, config: PhiMoEConfig, layer_idx: Optional[int] = None, ratio=1):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.is_causal = True
+        self.attention_dropout = config.attention_dropout
+        self.ratio = ratio
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(f"hidden_size must be divisible by num_heads")
+
+        low_rank = int(self.hidden_size * self.ratio / 2)
+        
+        self.q_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.q_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
+        self.k_u_proj = nn.Linear(low_rank, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.k_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
+        self.v_u_proj = nn.Linear(low_rank, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
+        self.o_u_proj = nn.Linear(low_rank, self.hidden_size, bias=config.attention_bias)
+        self.o_v_proj = nn.Linear(self.num_heads * self.head_dim, low_rank, bias=False)
+
+        self.rotary_emb = PhiMoERotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            base=self.rope_theta,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_u_proj(self.q_v_proj(hidden_states))
+        key_states = self.k_u_proj(self.k_v_proj(hidden_states))
+        value_states = self.v_u_proj(self.v_v_proj(hidden_states))
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index."
+                )
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is {attn_output.size()}")
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_u_proj(self.o_v_proj(attn_output))
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+class SVD_PhiMoESparseMoeBlock(nn.Module):
+    def __init__(self, config: PhiMoEConfig, ratio=1):
+        super().__init__()
+        self.hidden_dim = config.hidden_size
+        self.ffn_dim = config.intermediate_size
+        self.num_experts = config.num_local_experts
+        self.top_k = config.num_experts_per_tok
+        self.router_jitter_noise = config.router_jitter_noise
+        self.ratio = ratio
+        
+        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
+        
+        self.low_rank = int(self.ffn_dim * self.hidden_dim * self.ratio / (self.ffn_dim + self.hidden_dim))
+        
+        self.shared_w1_v = nn.Linear(self.hidden_dim, self.low_rank, bias=False)
+        self.shared_w2_v = nn.Linear(self.ffn_dim, self.low_rank, bias=False)
+        self.shared_w3_v = nn.Linear(self.hidden_dim, self.low_rank, bias=False)
+        
+        nn.init.zeros_(self.shared_w1_v.weight)
+        nn.init.zeros_(self.shared_w2_v.weight)
+        nn.init.zeros_(self.shared_w3_v.weight)
+
+        self.experts = nn.ModuleList([
+            PhiMoECompressedExpert(config, self.low_rank, self.shared_w1_v, self.shared_w2_v, self.shared_w3_v)
+            for _ in range(self.num_experts)
+        ])
+        
+        self.output_router_logits = config.output_router_logits
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if self.training and self.router_jitter_noise > 0:
+            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.router_jitter_noise, 1.0 + self.router_jitter_noise)
+
+        router_logits = self.gate(hidden_states)
+        
+        routing_weights = F.softmax(router_logits, dim=-1)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx])
+            if top_x.shape[0] == 0:
+                continue
+
+            top_x_list = top_x.tolist()
+            idx_list = idx.tolist()
+
+            current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states, router_logits
+
+class PhiMoECompressedExpert(nn.Module):
+    def __init__(self, config: PhiMoEConfig, low_rank, shared_w1_v, shared_w2_v, shared_w3_v):
+        super().__init__()
+        self.w1_u = nn.Linear(low_rank, config.intermediate_size, bias=False)
+        self.w2_u = nn.Linear(low_rank, config.hidden_size, bias=False)
+        self.w3_u = nn.Linear(low_rank, config.intermediate_size, bias=False)
+
+        nn.init.zeros_(self.w1_u.weight)
+        nn.init.zeros_(self.w2_u.weight)
+        nn.init.zeros_(self.w3_u.weight)
+
+        self.shared_w1_v = shared_w1_v
+        self.shared_w2_v = shared_w2_v
+        self.shared_w3_v = shared_w3_v
+        
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_states):
+        w1_v_out = self.shared_w1_v(hidden_states)
+        w1_out = self.act_fn(self.w1_u(w1_v_out))
+        w3_v_out = self.shared_w3_v(hidden_states)
+        w3_out = self.w3_u(w3_v_out)
+        current_hidden_states = w1_out * w3_out
+        w2_v_out = self.shared_w2_v(current_hidden_states)
+        current_hidden_states = self.w2_u(w2_v_out)
+        return current_hidden_states
+
+class PhiMoERotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.max_seq_len_cached = max_position_embeddings
+        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+
+    def forward(self, x, seq_len=None):
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+
+        return (
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+        )
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1).to(device)
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    cos = cos[position_ids].unsqueeze(1)
+    sin = sin[position_ids].unsqueeze(1)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
+    The hidden states go from (batch, num_key_value_heads, seqlen, head_dim) to
+    (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+class SVD_PhiMoEDecoderLayer(nn.Module):
+    def __init__(self, config: PhiMoEConfig, layer_idx: int, ratio=1):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = SVD_PhiMoEAttention(config, layer_idx=layer_idx, ratio=ratio)
+        self.block_sparse_moe = SVD_PhiMoESparseMoeBlock(config, ratio=ratio)
+        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps, elementwise_affine=True)
+        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps, elementwise_affine=True)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        output_router_logits: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+        )
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        if use_cache:
+            outputs += (present_key_value,)
+
+        if output_router_logits:
+            outputs += (router_logits,)
+
+        return outputs

@@ -1,0 +1,29 @@
+# Ignore cache directories
+cache/
+**/__pycache__
+
+# Ignore specific files
+utils/c4-*
+
+# Ignore IDE-specific files
+.vscode/
+
+# Ignore large data files or model checkpoints
+*.safetensors
+*.model
+*.pt
+*.pth
+*.bin
+*.pkl
+# Ignore log files
+*.log
+*.lo
+*.json
+*.text
+*.txt
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore DeFT-SVDLLM-OWL project folder
+DeFT-SVDLLM-OWL/output_results/
